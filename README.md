@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/shell-bash-4%2B-blue.svg)](install.sh)
-[![Tests](https://img.shields.io/badge/tests-260%20passing-brightgreen.svg)](tests/run-tests.sh)
+[![Tests](https://img.shields.io/badge/tests-273%20passing-brightgreen.svg)](tests/run-tests.sh)
 
 ---
 
@@ -164,10 +164,10 @@ second.
 
 1. **Checks** it really is Arch, that `sudo` works, and that the internet is up (needed only to install packages).
 2. **Installs what is missing** — `ntfs-3g` and `udisks2` — asking first.
-3. **Writes the fix**: `/etc/udisks2/mount_options.conf` with `ntfs_drivers=ntfs`, keeping a `.bak` if one existed.
-4. **Restarts udisks2** and then **reads its log** to prove the file was accepted.
+3. **Writes the fix**: `/etc/udisks2/mount_options.conf` with `ntfs_drivers=ntfs`, keeping a `.bak` if a *different* file was there. If the file is already exactly right, it changes **nothing at all** — no rewrite, no `.bak`, and no udisks2 restart, so running it twice is safe.
+4. **Restarts udisks2** (only after a real write) and then **reads its log** to prove the file was accepted.
 5. **Finds your NTFS disk by itself** (nothing hardcoded — ask for `sdb1`, it finds `sdb1`), handles several disks, and works whether it is plugged in or not.
-6. **Mounts it and proves it is read-write**, printing the driver, mount point and options.
+6. **Mounts it and proves it is read-write**, printing the driver, mount point and options. If it cannot, it explains *that* error — a disk udisks2 cannot resolve is not the same problem as a dirty volume, and it is never treated as one.
 
 ## Options
 
@@ -516,6 +516,37 @@ It writes filesystem metadata, so it asks first.
 </details>
 
 <details>
+<summary><b>"AlreadyMounted: Device ... is already mounted"</b></summary>
+
+That is a **success**, not a failure — the volume you asked for is open. The
+script treats it as one, and reports it read-write. If you want it somewhere
+else:
+
+```bash
+udisksctl unmount -b /dev/sdX1
+udisksctl mount   -b /dev/sdX1
+```
+</details>
+
+<details>
+<summary><b>"Error looking up object for device"</b></summary>
+
+udisks2 does not know that device *right now*. That is **not** a filesystem
+problem, so `chkdsk` and `--try-force` (which writes to the disk) are both the
+wrong tool — the script says so and stops instead of guessing. The usual causes:
+
+1. **udisks2 was just restarted.** Installing the fix restarts it on purpose, and
+   for a moment its device list is empty. The script retries three times for
+   exactly this reason; if it still fails, wait a second and run it again.
+2. **The disk was re-plugged and got a new name.** Look with `lsblk -f`, or let
+   the script find it: `./install.sh --list`.
+3. **Something else already has it open** — `findmnt /dev/sdX1` tells you where.
+
+The kernel log says whether the disk itself is fine:
+`journalctl -k | tail -30`.
+</details>
+
+<details>
 <summary><b>"no NTFS partition found"</b></summary>
 
 * `lsblk -f` — is the disk visible at all? A **USB-SATA adapter** shows up as `sdb`, not `usb`.
@@ -556,7 +587,7 @@ Run `chkdsk X: /f /x` in Windows, then `./install.sh --uninstall`.
 ./tests/run-tests.sh
 ```
 
-260 checks, and **no root and no real system changes needed**: every command the
+273 checks, and **no root and no real system changes needed**: every command the
 script uses (`sudo`, `pacman`, `udisksctl`, `systemctl`, `lsblk`, `findmnt`, …)
 is replaced by a fake, and the paths it writes to point at a throwaway sandbox.
 CI runs the same suite on every push. Because the tests capture the output, the
@@ -630,7 +661,7 @@ locales, and anyone with a disk shape that breaks the detection. Please keep the
 safety promises above intact and add a test with your change:
 
 ```bash
-./tests/run-tests.sh     # must stay 260/260 (or more)
+./tests/run-tests.sh     # must stay 273/273 (or more)
 ```
 
 ## License

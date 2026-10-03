@@ -12,6 +12,13 @@ Thanks for helping.
 3. **On failure, teach.** Every `die` must explain the reason and print manual
    instructions.
 4. **Add a test with every change.**
+5. **stdout is the answer, stderr is the story.** Several functions are called as
+   `$(...)` to capture their one-word answer, so anything else they print must go
+   to **stderr**. This is not hypothetical — a prompt printed to stdout once
+   leaked into a device name, and the tool then tried to open a disk called
+   `which disk should I test? ...` (`Error looking up object for device`).
+   Prompts, warnings and explanations go to stderr; only the answer goes to
+   stdout.
 
 ```bash
 shellcheck install.sh tests/run-tests.sh     # no output = clean
@@ -28,6 +35,15 @@ sandbox in `mktemp -d` and puts **fake** `sudo`, `pacman`, `udisksctl`, `systemc
 
 To test a new scenario: set the relevant `STUB_*` variable (see `base_env`), call
 `run --some-flag`, and assert on the exit code and the output.
+
+Two details before you write a test:
+
+* `base_env` sets `MOUNT_RETRY_DELAY=0`. The real script waits a second between
+  mount retries (udisks2 can be slow to notice a device); the suite must not sit
+  through that wait. Same code path, no sleeping.
+* The one check that needs a real **terminal** — the disk prompt only exists when
+  stdin is a tty — builds a pty with `script(1)`, and skips itself if `script`
+  is missing.
 
 Exit codes are meaningful, so tests can assert on them:
 

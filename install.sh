@@ -732,6 +732,23 @@ install_config() {
     return 0
   fi
 
+  # Written through a temp file so a crash can never leave a half-written
+  # config behind (a half-written config = udisks2 ignores it).
+  local tmp
+  tmp=$(mktemp) || die 1 "could not create a temporary file"
+  config_content > "$tmp"
+
+  # Already exactly right? Then change NOTHING: no backup, no rewrite, and no
+  # udisks2 restart. A restart is not free - every mounted disk briefly
+  # disappears from udisks2's list while it comes back, and a disk that was
+  # already open can then be reported as "could not be opened". A no-op run
+  # must be a no-op.
+  if have_file "$CONFIG_PATH" && cmp -s "$tmp" "$CONFIG_PATH"; then
+    rm -f "$tmp"
+    printf 'already in place - nothing to change'
+    return 0
+  fi
+
   if have_file "$CONFIG_PATH"; then
     note "keeping a backup" \
       "$CONFIG_PATH" \
@@ -740,11 +757,6 @@ install_config() {
     sudo cp -a "$CONFIG_PATH" "$CONFIG_PATH.bak"
   fi
 
-  # Written through a temp file so a crash can never leave a half-written
-  # config behind (a half-written config = udisks2 ignores it).
-  local tmp
-  tmp=$(mktemp) || die 1 "could not create a temporary file"
-  config_content > "$tmp"
   sudo install -m 644 -o root -g root "$tmp" "$CONFIG_PATH"
   rm -f "$tmp"
 
@@ -972,7 +984,13 @@ choose_disk() {
      which one you mean. Nothing was done - run it again like:
          ./install.sh --disk 1"
   else
-    say "which disk should I test? (a number, or Enter for the first one)"
+    # NOT via say(): main() captures this function's stdout to get the device
+    # name, and say() writes to stdout, so anything said here becomes part of
+    # that name. That really happened once: the device became
+    # "which disk should I test? ... /dev/sdb1" and udisksctl answered
+    # "Error looking up object for device". A prompt is story, not an answer.
+    printf '     %swhich disk should I test? (a number, or Enter for the first one):%s ' \
+      "$C_B" "$C_0" >&2
     read -r reply || reply=""
     reply=${reply:-1}
     if ! [[ $reply =~ ^[0-9]+$ ]] || (( reply < 1 || reply > total )); then
@@ -1798,23 +1816,42 @@ first_aid() {
 # On success it prints the mount point (and nothing else) so the caller can put
 # it on a single tidy line. Every failure explains itself and returns 1.
 mount_and_verify() {
-  local dev=$1 target="" opts="" out=""
+  local dev=$1 target="" opts="" out="" kind="" ok=0 tries=0
 
+  # Already open? Then there is nothing to mount - just prove it is read-write.
   if findmnt -n "$dev" >/dev/null 2>&1; then
-    target=$(findmnt -no TARGET "$dev")        # already open - nothing to do
+    target=$(findmnt -no TARGET "$dev")
   else
     if [[ ${DRY_RUN:-0} == 1 ]]; then
       say "[dry-run] would run: udisksctl mount -b $dev" >&2
       printf 'dry run - nothing mounted'
       return 0
     fi
-    if out=$(udisksctl mount -b "$dev" 2>&1); then
-      :
-    else
+
+    # udisks2 can be a moment late: this script restarts it on purpose, and a
+    # disk that was just plugged in may not be in its list yet. "Error looking
+    # up object for device" is that, not a filesystem problem - so try a few
+    # times before believing it. (MOUNT_RETRY_DELAY exists so the test suite
+    # does not have to sit through the wait; it changes nothing else.)
+    while (( tries < 3 )); do
+      tries=$((tries + 1))
+      if out=$(udisksctl mount -b "$dev" 2>&1); then ok=1; break; fi
+      kind=$(mount_error_kind "$out")
+      if [[ $kind == already ]]; then ok=1; break; fi   # open already = success
+      [[ $kind == missing ]] || break                   # a real error: no spinning
+      sleep "${MOUNT_RETRY_DELAY:-1}"
+    done
+
+    # The tool said no - but if the volume is open anyway (something else may
+    # have mounted it in the meantime), that is a success, not a failure.
+    if (( ok == 0 )) && findmnt -n "$dev" >/dev/null 2>&1; then ok=1; fi
+
+    if (( ok == 0 )); then
       warn "udisksctl could not mount it: $out"
-      explain_failure "$dev"
+      explain_failure "$dev" "$out"
       return 1
     fi
+
     target=$(findmnt -no TARGET "$dev" 2>/dev/null || true)
     if [[ -z $target ]]; then
       warn "mount reported success but nothing is mounted"
@@ -1825,7 +1862,7 @@ mount_and_verify() {
   opts=$(findmnt -no OPTIONS "$dev")
   if [[ ,$opts, != *,rw,* ]]; then
     warn "still read-only."
-    explain_failure "$dev"
+    explain_failure "$dev" "read-only"
     return 1
   fi
 
@@ -1880,8 +1917,33 @@ explain_hardware() {
 EOF
 }
 
+# Which kind of mount error is this? ONE word, so the advice can match the
+# error instead of always blaming the volume. Getting this wrong is worse than
+# saying nothing: telling someone to force-mount (which WRITES filesystem
+# metadata) because udisks2 merely did not know the device name is exactly the
+# kind of advice that costs data.
+mount_error_kind() {   # $1 = what the tool said
+  local e=${1,,}
+  if [[ $e == *alreadymounted* || $e == *"already mounted"* ]]; then
+    printf 'already'
+  elif [[ $e == *"looking up object"* || $e == *"no such device"* \
+       || $e == *"not found"* || $e == *"no object"* \
+       || $e == *"unknown device"* || $e == *"does not exist"* ]]; then
+    printf 'missing'
+  elif [[ $e == *read-only* || $e == *readonly* || $e == *"scheduled for check"* \
+       || $e == *dirty* || $e == *"wrong fs type"* || $e == *"bad superblock"* \
+       || $e == *"bad option"* || $e == *hibernat* || $e == *"not a valid ntfs"* ]]; then
+    printf 'dirty'
+  else
+    printf 'other'
+  fi
+}
+
+# Every failure explains itself - but it has to explain the RIGHT thing.
+# $1 = the device, $2 = what the tool actually said (optional; shown as-is when
+# the error is not one we recognise, because a guess is worse than the truth).
 explain_failure() {
-  local dev=${1:-/dev/sdX1}
+  local dev=${1:-/dev/sdX1} err=${2:-} kind
 
   # Ask the kernel first: did the disk physically fall off the bus? If it did,
   # blaming the filesystem would send the user down the wrong road.
@@ -1890,7 +1952,43 @@ explain_failure() {
     return 0
   fi
 
-  cat >&2 <<EOF
+  kind=$(mount_error_kind "$err")
+
+  case $kind in
+    already)
+      cat >&2 <<EOF
+
+  --------------------------------------------------------------------------
+   IT IS ALREADY OPEN - nothing is wrong
+  --------------------------------------------------------------------------
+   Something has this volume mounted right now, so there was nothing left for
+   this step to do. Check it yourself with:
+        findmnt $dev
+   If it says "rw" in the options, you are done - open it in your file manager.
+  --------------------------------------------------------------------------
+EOF
+      ;;
+    missing)
+      cat >&2 <<EOF
+
+  --------------------------------------------------------------------------
+   UDISKS2 DOES NOT KNOW THIS DEVICE
+  --------------------------------------------------------------------------
+   The tool said:  ${err:-no message}
+
+   This is not a filesystem problem, so chkdsk would not help and neither
+   would --try-force (which writes to the disk). The usual causes:
+     1) the disk was re-plugged and got a new name - look with:  lsblk -f
+     2) udisks2 is still waking up (this script restarts it on purpose) -
+        wait a second and simply run the script again
+     3) something else already opened it - check with:  findmnt $dev
+   The kernel log says whether the disk itself is fine:
+        journalctl -k | tail -30
+  --------------------------------------------------------------------------
+EOF
+      ;;
+    dirty)
+      cat >&2 <<EOF
 
   --------------------------------------------------------------------------
    WHY IT STILL REFUSES
@@ -1911,6 +2009,29 @@ explain_failure() {
    flag) and unmounts it again. It writes filesystem metadata, so it asks first.
   --------------------------------------------------------------------------
 EOF
+      ;;
+    *)
+      cat >&2 <<EOF
+
+  --------------------------------------------------------------------------
+   WHY IT STILL REFUSES
+  --------------------------------------------------------------------------
+   The tool's own words:
+        ${err:-no message}
+
+   Two things cover almost every case:
+     - the volume is marked "check me first" (Windows Fast Startup, or a disk
+       unplugged while it was writing). On the Windows PC, as Administrator:
+            chkdsk X: /f /x
+            powercfg /h off        <- stops Fast Startup dirtying it again
+       (a Linux-only route for that flag is:  ./install.sh --try-force)
+     - the connection, not the disk: unplug it, try another port and a shorter
+       cable, then look at what the kernel said:
+            journalctl -k | tail -30
+  --------------------------------------------------------------------------
+EOF
+      ;;
+  esac
 }
 
 try_force() {

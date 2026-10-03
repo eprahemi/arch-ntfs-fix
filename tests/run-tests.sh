@@ -129,6 +129,17 @@ case "${1:-}" in
       echo "Error mounting $dev: GDBus.Error:org.freedesktop.UDisks2.Error.Failed: wrong fs type, bad option, bad superblock" >&2
       exit 1
     fi
+    # The volume is already mounted - udisksctl's own words from a real run.
+    if [[ ${STUB_MOUNT_ALREADY:-0} == 1 ]]; then
+      echo "Error mounting $dev: GDBus.Error:org.freedesktop.UDisks2.Error.AlreadyMounted: Device $dev is already mounted at /run/media/eprahemi/MAYBE." >&2
+      exit 1
+    fi
+    # udisks2 does not know the device at all (it was just restarted, or the
+    # disk was re-plugged and got a new name). NOT a filesystem error.
+    if [[ ${STUB_MOUNT_LOOKUP_FAIL:-0} == 1 ]]; then
+      echo "Error looking up object for device $dev" >&2
+      exit 1
+    fi
     echo "Mounted $dev at ${STUB_TARGET:-$STUB_STATE/mnt/500GB}"
     exit 0 ;;
   unmount)
@@ -353,6 +364,10 @@ base_env() {
   export STUB_NET_OK=1 STUB_MOUNTED=0 STUB_MOUNT_FAIL=0 STUB_PACMAN_FAIL=0
   export STUB_SYSTEMCTL_FAIL=0 STUB_JOURNAL_COMPLAINT=0 STUB_FORCE_MOUNT_FAIL=0
   export STUB_HARDWARE_FAIL=0
+  export STUB_MOUNT_ALREADY=0 STUB_MOUNT_LOOKUP_FAIL=0
+  # The mount step waits a second between retries so a slow udisks2 gets a real
+  # chance. The suite must not sit through that wait: 0 seconds, same code path.
+  export MOUNT_RETRY_DELAY=0
   export STUB_OPTIONS="rw,nosuid,nodev,relatime" STUB_FSTYPE=fuseblk
   export STUB_TARGET="$SB/mnt/500GB"
   export STUB_SOURCE=/dev/sda5
@@ -537,7 +552,10 @@ out=$(run --yes); rc=$?
 grep -q '^ntfs_drivers=ntfs$' "$SB/etc/mount_options.conf" 2>/dev/null && ok "  ...with the right content" || bad "wrong config content"
 
 head_ "4. the tricky real-world failures"
-one_disk
+# This one needs the WRITE path: the config is written, udisks2 is restarted and
+# the log is read back. So the config must NOT already be there - a run with an
+# identical config is deliberately a no-op now.
+base_env; one_disk
 
 export STUB_JOURNAL_COMPLAINT=1
 out=$(run --yes); rc=$?
@@ -585,6 +603,83 @@ out=$(run --try-force --yes); rc=$?
 unset STUB_FORCE_MOUNT_FAIL
 [[ $out == *"real damage"* ]] && ok "a failing force mount is called damage, not just a flag" \
   || bad "force-failure wording"
+
+head_ "4b. failures that are NOT the disk's fault"
+
+# Every one of these came out of a real run on a real laptop with two disks
+# plugged in (2026-10-03). The old code answered all of them with the
+# dirty-volume speech and offered --try-force - a "repair" that WRITES to the
+# disk. For a device udisks2 simply could not resolve, that is the wrong advice,
+# and one of them was a plain code bug: a prompt leaked into the device name.
+
+# 1) udisks2 does not know the device. It had just been restarted (the script
+#    does that on purpose) and the disk was not in its list yet.
+base_env; one_disk
+export STUB_MOUNT_LOOKUP_FAIL=1
+out=$(run --yes); rc=$?
+unset STUB_MOUNT_LOOKUP_FAIL
+[[ $rc -eq 7 ]] && ok "a device udisks2 cannot resolve is a failure, not a silent pass (rc=7)" \
+  || bad "unknown-device path (rc=$rc)"
+[[ $out == *"UDISKS2 DOES NOT KNOW THIS DEVICE"* ]] && ok "  ...and names the real cause" \
+  || bad "wrong diagnosis shown"
+[[ $out != *"chkdsk X: /f /x"* ]] && ok "  ...and does NOT send them to Windows for it" \
+  || bad "chkdsk advice for a device-lookup error"
+[[ $out != *"./install.sh --try-force"* ]] \
+  && ok "  ...and never tells them to run it (that writes to the disk)" \
+  || bad "recommended --try-force for a device-lookup error"
+[[ $(grep -c '^mount ' "$SB/label_calls") -eq 3 ]] \
+  && ok "  ...and it tried three times first (udisks2 can just be slow)" \
+  || bad "retry count wrong: $(grep -c '^mount ' "$SB/label_calls")"
+
+# 2) something already has the volume mounted and udisksctl says so. That is a
+#    SUCCESS - anything else turns a perfectly good disk into a red error on
+#    screen (which is exactly what happened on the laptop).
+base_env; one_disk
+export STUB_MOUNT_ALREADY=1
+out=$(run --yes); rc=$?
+unset STUB_MOUNT_ALREADY
+[[ $rc -eq 0 && $out == *"READ-WRITE"* ]] \
+  && ok "a disk that is already mounted counts as success (rc=0)" \
+  || bad "already-mounted reported as a failure (rc=$rc)"
+[[ $out != *"could not open it"* ]] && ok "  ...and is never called a failure on screen" \
+  || bad "said 'could not open it' for a disk that was open"
+
+# 3) a second run with the very same config must be a true no-op: no rewrite, no
+#    pointless .bak, and above all NO udisks2 restart - a restart makes every
+#    mounted disk briefly disappear from udisks2's list and come back.
+base_env; one_disk
+out=$(run --yes); rc=$?
+[[ $rc -eq 0 && $out == *"written, udisks2 restarted"* ]] \
+  && ok "the first run writes the fix and restarts udisks2" || bad "first run (rc=$rc)"
+calls_before=$(grep -c . "$SB/label_calls")
+export STUB_MOUNTED=1        # pretend something has it mounted already
+out=$(run --yes); rc=$?
+unset STUB_MOUNTED
+[[ $rc -eq 0 && $out == *"already in place"* ]] \
+  && ok "a second run says the fix is already in place" || bad "second run (rc=$rc)"
+[[ $out != *"udisks2 restarted"* ]] \
+  && ok "  ...and does NOT restart udisks2 for nothing" || bad "restarted udisks2 for nothing"
+[[ ! -f $SB/etc/mount_options.conf.bak ]] \
+  && ok "  ...and makes no pointless .bak copy" || bad "a needless backup was made"
+[[ $(grep -c . "$SB/label_calls") -eq $calls_before ]] \
+  && ok "  ...and does not touch the disk again either" || bad "the second run touched the disk"
+
+# 4) THE CODE BUG ITSELF. The disk chooser is called as $(choose_disk), so its
+#    stdout IS the device name - and the "which disk?" prompt was printed to
+#    stdout by say(). The device name therefore became
+#    "which disk should I test? ... /dev/sdb1", and udisksctl answered
+#    "Error looking up object for device". The prompt only exists on a real
+#    terminal, so this test needs a pty: script(1) makes one.
+if command -v script >/dev/null 2>&1; then
+  base_env; two_disks
+  printf '1\n' | timeout 30 script -qec \
+    "env PATH='$SB/bin:/usr/bin:/bin' STUB_STATE='$SB' '$SB/fix.sh' --plain --yes" \
+    /dev/null >/dev/null 2>&1
+  raw=$(grep '^mount ' "$SB/label_calls" || true)
+  [[ $raw == 'mount /dev/sdb1' ]] \
+    && ok "the disk prompt never leaks into the device name (real pty run)" \
+    || bad "device name leaked into the mount call: [$raw]"
+fi
 
 head_ "5. finding the disk by itself (nothing hardcoded)"
 
