@@ -972,6 +972,15 @@ choose_disk() {
     { printf '\n'; show_disks; printf '\n'; } >&2
   fi
 
+  # "test every disk" - either --all, or the letter a typed at the prompt. It
+  # prints one device per line, and all of them go to stdout on purpose: main()
+  # reads this function's stdout to learn WHICH disks to test, so a list of
+  # names is exactly as good an answer as a single name.
+  if [[ ${ALL_DISKS:-0} == 1 ]]; then
+    printf '%s\n' "${names[@]}"
+    return 0
+  fi
+
   if [[ -n ${DISK_CHOICE:-} ]]; then
     if ! [[ $DISK_CHOICE =~ ^[0-9]+$ ]] || (( DISK_CHOICE < 1 || DISK_CHOICE > total )); then
       soft_stop 6 "--disk has to be a number between 1 and $total, nothing was done."
@@ -982,19 +991,25 @@ choose_disk() {
   elif [[ ! -t 0 ]]; then
     soft_stop 6 "there is more than one NTFS disk here and no terminal to ask
      which one you mean. Nothing was done - run it again like:
-         ./install.sh --disk 1"
+         ./install.sh --disk 1        (or --all, to test every one)"
   else
     # NOT via say(): main() captures this function's stdout to get the device
     # name, and say() writes to stdout, so anything said here becomes part of
     # that name. That really happened once: the device became
     # "which disk should I test? ... /dev/sdb1" and udisksctl answered
     # "Error looking up object for device". A prompt is story, not an answer.
-    printf '     %swhich disk should I test? (a number, or Enter for the first one):%s ' \
+    printf '     %swhich disk should I test? (a number, Enter for the first one, or a for all):%s ' \
       "$C_B" "$C_0" >&2
     read -r reply || reply=""
     reply=${reply:-1}
+    reply=${reply,,}                    # a, A, all, ALL - all the same thing
+    if [[ $reply == a || $reply == all ]]; then
+      printf '%s\n' "${names[@]}"
+      return 0
+    fi
     if ! [[ $reply =~ ^[0-9]+$ ]] || (( reply < 1 || reply > total )); then
-      soft_stop 6 "\"$reply\" is not a number between 1 and $total - nothing was done."
+      soft_stop 6 "\"$reply\" is not a number between 1 and $total - nothing was done.
+     (a number from 1 to $total, or a for all of them)"
     fi
     pick=${names[$((reply - 1))]}
   fi
@@ -2217,6 +2232,9 @@ usage() {
                        skips the last question.
   --list               just list the NTFS disks it can see, then exit
   --disk N             use disk number N from that list
+  --all                test EVERY NTFS disk it finds instead of asking which
+                       one. Two disks or a hundred, it does them one after the
+                       other, and never lets a bad one hide the good ones.
   --status             read-only report: is the fix installed, and what
                        disks are plugged in?
 
@@ -2274,6 +2292,7 @@ EOF
 # ------------------------------------------------------------------ main -----
 main() {
   ASSUME_YES=0 DRY_RUN=0 CLEAR_FLAG=0 DISK_CHOICE="" ACTION="install" PURGE=0
+  ALL_DISKS=0
 
   NEWNAME=""
 
@@ -2312,6 +2331,7 @@ main() {
         [[ -n ${2:-} ]] || die 2 "--disk needs a number, for example: --disk 1"
         DISK_CHOICE=$2; shift ;;
       --disk=*)         DISK_CHOICE=${1#*=} ;;
+      --all|all)        ALL_DISKS=1 ;;
       *)
         printf '\n  I do not know the option: %s\n' "$1" >&2
         printf '  For the full list:  ./install.sh --help     (or just: help, -help, h)\n\n' >&2
@@ -2325,8 +2345,17 @@ main() {
   fi
 
   if [[ $PURGE == 1 && $ACTION != uninstall ]]; then
-    die 2 "--purge only makes sense together with --uninstall, for example:
+    soft_stop 2 "--purge only makes sense together with --uninstall, for example:
        ./install.sh --uninstall --purge"
+  fi
+
+  # --disk 2 --all has no clear meaning: one disk, or every disk? Rather than
+  # guess, say so and stop - guessing here would be a bug pretending to be a
+  # feature. soft_stop, not die: nothing is broken and nothing was changed, so
+  # there is no reason to dump the do-it-by-hand list at the reader.
+  if [[ $ALL_DISKS == 1 && -n ${DISK_CHOICE:-} ]]; then
+    soft_stop 2 "pick one, please: --disk N tests that one disk, --all tests every one.
+       Asking for both has no clear meaning, so nothing was done."
   fi
 
   local r dev label size target
@@ -2397,10 +2426,27 @@ main() {
 
   step_begin "writing the fix"; r=$(install_config); step_done "$r"
 
-  dev=$(choose_disk)
-  label=$(disk_field "$dev" 2)
-  size=$(disk_field "$dev" 3)
-  line_ok "your disk" "$dev  ${label:+$label }${size:+($size)}"
+  # ---- which disks to test: one, or every one ------------------------------
+  # choose_disk prints ONE DEVICE PER LINE, so this reads the same way for one
+  # disk and for a hundred - no special case anywhere. $(...) also keeps the
+  # function's exit code, so "no disk here" or a bad --disk value still stops
+  # the script right here.
+  local devs
+  devs=$(choose_disk)
+  local -a disks=() ok_lines=() no_lines=()
+  mapfile -t disks <<< "$devs"
+  local howmany=${#disks[@]} i=0 ready=0 failed=0
+
+  for dev in "${disks[@]}"; do
+    i=$((i + 1))
+    label=$(disk_field "$dev" 2)
+    size=$(disk_field "$dev" 3)
+    if (( howmany == 1 )); then
+      line_ok "your disk" "$dev  ${label:+$label }${size:+($size)}"
+    else
+      line_ok "disk $i" "$dev  ${label:+$label }${size:+($size)}"
+    fi
+  done
 
   if [[ ${DRY_RUN:-0} == 1 ]]; then
     say "the rehearsal ends here - nothing was changed"
@@ -2408,31 +2454,72 @@ main() {
   fi
 
   if [[ $ACTION == force ]]; then
-    try_force "$dev" || exit 7
+    for dev in "${disks[@]}"; do
+      try_force "$dev" || failed=1
+    done
+    (( failed == 0 )) || exit 7
   fi
 
-  step_begin "opening it"
-  if target=$(mount_and_verify "$dev"); then
-    step_done "mounted read-write"
-  else
-    step_done "could not open it" warn
+  # One disk: the same single line as always. Several: a line each. Every disk
+  # gets its own try, so one bad disk can never hide the good ones.
+  for dev in "${disks[@]}"; do
+    label=$(disk_field "$dev" 2)
+    if (( howmany == 1 )); then step_begin "opening it"; else step_begin "opening $dev"; fi
+    if target=$(mount_and_verify "$dev"); then
+      step_done "mounted read-write"
+      ready=$((ready + 1))
+      ok_lines+=("${label:-$dev}|$target")
+    else
+      step_done "could not open it" warn
+      failed=$((failed + 1))
+      no_lines+=("${label:-$dev}|$dev")
+    fi
+  done
+
+  # ------- the ending: the friendly panel for one disk, a table for many -----
+  # One disk that failed ends exactly where it always did - right after the
+  # explanation, with exit 7 and no pretend-cheery panel underneath it.
+  if (( howmany == 1 && failed > 0 )); then
     exit 7
   fi
 
-  printf '\n'
-  progress_bar "spinning up $dev"
-  if [[ $ANIM == 1 ]]; then
-    reveal_name "$label"
+  local row row_dev l
+  if (( howmany == 1 )); then
+    printf '\n'
+    progress_bar "spinning up $dev"
+    if [[ $ANIM == 1 ]]; then
+      reveal_name "$label"
+    fi
+
+    printf '\n'
+    hr
+    printf '  WHAT YOU HAVE NOW\n'
+    hr
+    printf '  %s%s is ready - READ-WRITE%s\n' "$C_G" "${label:-$dev}" "$C_0"
+    printf '  mounted at %s\n' "$target"
+    printf '  open it with your file manager - or just double-click the disk\n'
+    printf '\n'
+  else
+    printf '\n'
+    progress_bar "$howmany disks"
+    printf '\n'
+    hr
+    printf '  WHAT YOU HAVE NOW\n'
+    hr
+    for row in "${ok_lines[@]}"; do
+      IFS='|' read -r l row_dev <<< "$row"
+      printf '  %s✓%s %-22s mounted read-write at %s\n' "$C_G" "$C_0" "$l" "$row_dev"
+    done
+    for row in "${no_lines[@]}"; do
+      IFS='|' read -r l row_dev <<< "$row"
+      printf '  %s!%s %-22s could not be opened - try:  ./install.sh --check-disk\n' \
+        "$C_Y" "$C_0" "$l"
+    done
+    printf '\n'
+    printf '  %s of %s disks ready\n' "$ready" "$howmany"
+    printf '\n'
   fi
 
-  printf '\n'
-  hr
-  printf '  WHAT YOU HAVE NOW\n'
-  hr
-  printf '  %s%s is ready - READ-WRITE%s\n' "$C_G" "${label:-$dev}" "$C_0"
-  printf '  mounted at %s\n' "$target"
-  printf '  open it with your file manager - or just double-click the disk\n'
-  printf '\n'
   printf '  %-15s %s\n' "nicer name:" "./install.sh --rename   (the name other systems show)"
   printf '  %-15s %s\n' "UNDO:" "./install.sh --uninstall   (keeps a copy)"
   printf '  %-15s %s\n' "NO LEFTOVERS:" "./install.sh --uninstall --purge   (keeps nothing)"
@@ -2440,6 +2527,10 @@ main() {
   printf '  %-15s %s\n' "on Windows:" "chkdsk X: /f /x   and   powercfg /h off   (once)"
   hr
   printf '\n'
+
+  # A disk that did not open is a real failure even when the others are fine -
+  # exit 7, so a script can tell the difference.
+  (( failed == 0 )) || exit 7
 }
 
 main "$@"

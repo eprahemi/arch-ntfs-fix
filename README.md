@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/shell-bash-4%2B-blue.svg)](install.sh)
-[![Tests](https://img.shields.io/badge/tests-273%20passing-brightgreen.svg)](tests/run-tests.sh)
+[![Tests](https://img.shields.io/badge/tests-294%20passing-brightgreen.svg)](tests/run-tests.sh)
 
 ---
 
@@ -139,6 +139,36 @@ in a clean box instead — any language, any brackets:
 
 A disk with no name at all gets big `READY`.
 
+## Several disks at once
+
+Plug in two disks and the script asks which one to test. Plug in a hundred and
+that question is useless, so there is `--all` — or just type `a` at the prompt.
+Every disk gets its own turn, its own line and its own result, so one disk that
+refuses to open can never hide the ones that work:
+
+```
+     #   DEVICE         SIZE      TYPE   USB?  MOUNTED LABEL
+     1   /dev/sdb1      465.8G    usb    yes   -      500GB
+     2   /dev/sdc1      931.5G    usb    yes   -      BACKUP
+
+  ✓ disk 1                            /dev/sdb1  500GB (465.8G)
+  ✓ disk 2                            /dev/sdc1  BACKUP (931.5G)
+  ✓ opening /dev/sdb1                 mounted read-write
+  ✓ opening /dev/sdc1                 mounted read-write
+
+------------------------------------------------------------
+  WHAT YOU HAVE NOW
+------------------------------------------------------------
+  ✓ 500GB                  mounted read-write at /run/media/you/500GB
+  ✓ BACKUP                 mounted read-write at /run/media/you/BACKUP
+
+  2 of 2 disks ready
+```
+
+If one of them cannot be opened, the run keeps going, names the one that failed,
+and ends with **exit code 7** so a script can still tell that something is wrong.
+`--disk N` and `--all` together are refused instead of guessed at.
+
 Small side-notes — like an existing config that has to be backed up first — get
 their own titled box, with room above and below, instead of loose `!!` lines
 stuck together:
@@ -166,7 +196,7 @@ second.
 2. **Installs what is missing** — `ntfs-3g` and `udisks2` — asking first.
 3. **Writes the fix**: `/etc/udisks2/mount_options.conf` with `ntfs_drivers=ntfs`, keeping a `.bak` if a *different* file was there. If the file is already exactly right, it changes **nothing at all** — no rewrite, no `.bak`, and no udisks2 restart, so running it twice is safe.
 4. **Restarts udisks2** (only after a real write) and then **reads its log** to prove the file was accepted.
-5. **Finds your NTFS disk by itself** (nothing hardcoded — ask for `sdb1`, it finds `sdb1`), handles several disks, and works whether it is plugged in or not.
+5. **Finds your NTFS disk by itself** (nothing hardcoded — ask for `sdb1`, it finds `sdb1`), handles several disks, and works whether it is plugged in or not. With more than one disk it asks which; `--all` (or just `a` at the prompt) does every one of them.
 6. **Mounts it and proves it is read-write**, printing the driver, mount point and options. If it cannot, it explains *that* error — a disk udisks2 cannot resolve is not the same problem as a dirty volume, and it is never treated as one.
 
 ## Options
@@ -175,6 +205,7 @@ second.
 |---|---|
 | `--list` | list the NTFS disks it can see, then exit |
 | `--disk N` | use disk number N (needed when there are several) |
+| `--all` | test **every** NTFS disk it finds, one after the other — two disks or a hundred. One that refuses to open never hides the ones that work (also `all`) |
 | `--dry-run` | print everything, change nothing |
 | `--yes` | do not ask questions (for scripts/CI) |
 | `--show-config` | print the config file it installs, then exit |
@@ -587,7 +618,7 @@ Run `chkdsk X: /f /x` in Windows, then `./install.sh --uninstall`.
 ./tests/run-tests.sh
 ```
 
-273 checks, and **no root and no real system changes needed**: every command the
+294 checks, and **no root and no real system changes needed**: every command the
 script uses (`sudo`, `pacman`, `udisksctl`, `systemctl`, `lsblk`, `findmnt`, …)
 is replaced by a fake, and the paths it writes to point at a throwaway sandbox.
 CI runs the same suite on every push. Because the tests capture the output, the
@@ -661,7 +692,7 @@ locales, and anyone with a disk shape that breaks the detection. Please keep the
 safety promises above intact and add a test with your change:
 
 ```bash
-./tests/run-tests.sh     # must stay 273/273 (or more)
+./tests/run-tests.sh     # must stay 294/294 (or more)
 ```
 
 ## License

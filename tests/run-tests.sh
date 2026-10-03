@@ -125,7 +125,7 @@ case "${1:-}" in
   mount)
     dev=""; for a in "$@"; do [[ $a == -b ]] && dev="${!#}"; done
     echo "mount $dev" >> "$STUB_STATE/label_calls"
-    if [[ ${STUB_MOUNT_FAIL:-0} == 1 ]]; then
+    if [[ ${STUB_MOUNT_FAIL:-0} == 1 || ${STUB_MOUNT_FAIL_DEV:-} == "$dev" ]]; then
       echo "Error mounting $dev: GDBus.Error:org.freedesktop.UDisks2.Error.Failed: wrong fs type, bad option, bad superblock" >&2
       exit 1
     fi
@@ -365,6 +365,7 @@ base_env() {
   export STUB_SYSTEMCTL_FAIL=0 STUB_JOURNAL_COMPLAINT=0 STUB_FORCE_MOUNT_FAIL=0
   export STUB_HARDWARE_FAIL=0
   export STUB_MOUNT_ALREADY=0 STUB_MOUNT_LOOKUP_FAIL=0
+  export STUB_MOUNT_FAIL_DEV=""
   # The mount step waits a second between retries so a slow udisks2 gets a real
   # chance. The suite must not sit through that wait: 0 seconds, same code path.
   export MOUNT_RETRY_DELAY=0
@@ -395,6 +396,14 @@ two_disks() {
   cat > "$SB/lsblk.out" <<EOF
 NAME="/dev/sdb1" FSTYPE="ntfs" LABEL="500GB" SIZE="465.8G" TRAN="usb" RM="1" MOUNTPOINT=""
 NAME="/dev/sdc1" FSTYPE="ntfs" LABEL="BACKUP" SIZE="931.5G" TRAN="usb" RM="1" MOUNTPOINT=""
+EOF
+}
+
+three_disks() {
+  cat > "$SB/lsblk.out" <<EOF
+NAME="/dev/sdb1" FSTYPE="ntfs" LABEL="Games" SIZE="931.5G" TRAN="usb" RM="1" MOUNTPOINT=""
+NAME="/dev/sdc1" FSTYPE="ntfs" LABEL="MAYBE" SIZE="465.8G" TRAN="usb" RM="1" MOUNTPOINT=""
+NAME="/dev/sdd1" FSTYPE="ntfs" LABEL="ARCHIVE" SIZE="1.8T" TRAN="usb" RM="1" MOUNTPOINT=""
 EOF
 }
 
@@ -701,6 +710,83 @@ out=$(run --yes --disk 9); rc=$?
 
 out=$("$SB/fix.sh" --list </dev/null 2>&1); rc=$?
 [[ $rc -eq 0 && $out == *BACKUP* ]] && ok "--list works on its own" || bad "--list (rc=$rc)"
+
+head_ "5b. every disk at once (--all, or a at the prompt)"
+
+# The user has two disks today. He asked for "all of them, even if there are
+# more than 2 or 100" - so the loop is tested with two AND with three, and the
+# one-bad-disk case is tested too: a bad disk must never hide the good ones.
+
+base_env; two_disks
+out=$(run --all --yes); rc=$?
+[[ $rc -eq 0 ]] && ok "--all opens every disk it finds (rc=0)" || bad "--all (rc=$rc)"
+[[ $(grep -c '^mount ' "$SB/label_calls") -eq 2 ]] \
+  && ok "  ...and really tried both of them, not just the first" \
+  || bad "mount calls: $(grep -c '^mount ' "$SB/label_calls")"
+[[ $out == *"2 of 2 disks ready"* ]] && ok "  ...and counts them at the end" || bad "no ready count"
+[[ $(printf '%s' "$out" | grep -c 'mounted read-write at') -eq 2 ]] \
+  && ok "  ...with one result line per disk" || bad "no per-disk result lines"
+[[ $out == *"WHAT YOU HAVE NOW"* ]] && ok "  ...and still ends with the tidy summary" || bad "no summary"
+
+base_env; three_disks
+out=$(run --all --yes); rc=$?
+[[ $rc -eq 0 && $(grep -c '^mount ' "$SB/label_calls") -eq 3 ]] \
+  && ok "--all is not a two-disk special case (three disks, three attempts)" \
+  || bad "three disks: rc=$rc, $(grep -c '^mount ' "$SB/label_calls") mounts"
+[[ $out == *"3 of 3 disks ready"* ]] && ok "  ...and counts all three" || bad "count wrong for three"
+
+# One bad disk must never hide the good ones - that is the whole point of a loop.
+base_env; two_disks
+export STUB_MOUNT_FAIL_DEV=/dev/sdc1
+out=$(run --all --yes); rc=$?
+unset STUB_MOUNT_FAIL_DEV
+[[ $rc -eq 7 ]] && ok "one disk failing -> exit 7, a script can still tell" || bad "rc=$rc with one bad disk"
+[[ $out == *"1 of 2 disks ready"* ]] && ok "  ...and the good disk is still reported ready" || bad "good disk lost"
+[[ $(printf '%s' "$out" | grep -c 'could not be opened') -eq 1 ]] \
+  && ok "  ...and the bad one is reported exactly once" || bad "bad disk not reported cleanly"
+[[ $out == *"/dev/sdb1"* && $out == *"/dev/sdc1"* ]] && ok "  ...and both disks are named" || bad "disk names missing"
+
+base_env; one_disk
+out=$(run --all --yes); rc=$?
+[[ $rc -eq 0 && $(grep -c '^mount ' "$SB/label_calls") -eq 1 ]] \
+  && ok "--all with a single disk is the normal run (one attempt)" \
+  || bad "single disk with --all (rc=$rc, $(grep -c '^mount ' "$SB/label_calls") mounts)"
+[[ $out == *"is ready - READ-WRITE"* ]] && ok "  ...and the cosy one-disk ending is unchanged" \
+  || bad "one-disk ending changed"
+
+base_env
+out=$(run --all --yes); rc=$?
+[[ $rc -eq 6 && $out == *"no NTFS disk to test yet"* ]] \
+  && ok "--all with no disk says so quietly (rc=6)" || bad "--all with no disk (rc=$rc)"
+
+base_env; two_disks
+out=$(run --all --disk 2 --yes); rc=$?
+[[ $rc -eq 2 && $out == *"pick one"* ]] && ok "--all plus --disk is refused (rc=2), never guessed" \
+  || bad "conflicting options (rc=$rc)"
+[[ $out != *"RATHER NOT RUN A SCRIPT"* ]] \
+  && ok "  ...and does not dump the by-hand list for a bad option" || bad "manual dump for a bad option"
+
+base_env; two_disks
+out=$(run --all --dry-run --yes); rc=$?
+[[ $rc -eq 0 ]] && ok "--all --dry-run finishes cleanly" || bad "dry run with --all (rc=$rc)"
+[[ ! -s "$SB/label_calls" ]] && ok "  ...and touched no disk at all" || bad "dry run touched a disk"
+[[ $out == *"/dev/sdb1"* && $out == *"/dev/sdc1"* ]] \
+  && ok "  ...but still names every disk it would test" || bad "dry run does not list the disks"
+
+# The prompt: typing "a" means all of them. That prompt only exists on a real
+# terminal, so this one needs a pty - script(1) makes one.
+if command -v script >/dev/null 2>&1; then
+  base_env; two_disks
+  printf 'a\n' | timeout 30 script -qec \
+    "env PATH='$SB/bin:/usr/bin:/bin' STUB_STATE='$SB' '$SB/fix.sh' --plain --yes" \
+    /dev/null >/dev/null 2>&1
+  n=$(grep -c '^mount ' "$SB/label_calls" || true)
+  [[ $n -eq 2 ]] && ok "typing a at the prompt tests every disk (real pty run)" \
+    || bad "typing a gave $n mount attempts, expected 2"
+fi
+
+out=$(run --help)
+[[ $out == *"--all"* ]] && ok "the help lists --all" || bad "--all missing from the help"
 
 head_ "6. dry run changes nothing"
 

@@ -36,13 +36,17 @@ sandbox in `mktemp -d` and puts **fake** `sudo`, `pacman`, `udisksctl`, `systemc
 To test a new scenario: set the relevant `STUB_*` variable (see `base_env`), call
 `run --some-flag`, and assert on the exit code and the output.
 
-Two details before you write a test:
+A few details before you write a test:
 
 * `base_env` sets `MOUNT_RETRY_DELAY=0`. The real script waits a second between
   mount retries (udisks2 can be slow to notice a device); the suite must not sit
   through that wait. Same code path, no sleeping.
-* The one check that needs a real **terminal** — the disk prompt only exists when
-  stdin is a tty — builds a pty with `script(1)`, and skips itself if `script`
+* `base_env` also empties `lsblk.out` ("no disk plugged in"), so a fixture
+  (`one_disk`, `two_disks`, `three_disks`, …) must be called **after** it. Set one
+  disk to fail with `STUB_MOUNT_FAIL_DEV=/dev/sdc1` when you want to prove that a
+  bad disk does not hide the good ones.
+* The two checks that need a real **terminal** — the disk prompt only exists when
+  stdin is a tty — build a pty with `script(1)`, and skip themselves if `script`
   is missing.
 
 Exit codes are meaningful, so tests can assert on them:
